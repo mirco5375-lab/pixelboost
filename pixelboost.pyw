@@ -1,30 +1,27 @@
 """
 PixelBoost
 ----------
-Ablauf:
-  1. Launcher-Fenster öffnet sich und fragt Firebase (Realtime Database, REST) nach der Version
+Erster Start (als .pyw von GitHub):
+  - Das Programm fragt, ob es sich einrichten darf. Bei "Akzeptieren" wird ein Ordner angelegt,
+    PixelBoost dort zu einer EXE gebaut und eine Verknüpfung auf den Desktop gelegt.
+  - Danach startest du PixelBoost nur noch über die Desktop-Verknüpfung.
+  - Mit dem Startparameter --dev startet die .pyw direkt, ohne Einrichtung (zum Entwickeln).
+
+Ablauf beim Start:
+  1. Launcher-Fenster fragt Firebase (Realtime Database, REST) nach der Version
   2. Ist eine neuere Version da, bricht der Launcher ab und zeigt
-     "Bitte aktualisiere deinen Launcher". Ein Klick auf "Starten" lädt das Update,
-     ersetzt die Datei und startet neu.
-  3. Sonst öffnet sich das Hauptfenster (Grafik / Boost)
+     "Bitte aktualisiere deinen Launcher". Ein Klick auf "Starten" lädt das Update.
+     (Bei der EXE wird nur die Programmdatei getauscht – schnell, ohne neues Bauen.)
+  3. Sonst öffnet sich das Hauptfenster (Grafik / Boost / Einstellungen)
   4. Schließt man das Fenster, läuft PixelBoost im Infobereich (Tray) weiter.
-     Rechtsklick auf das Symbol -> "Öffnen" oder "Beenden".
-     Startet man PixelBoost erneut, wird die alte Instanz beendet und der Launcher
-     prüft wieder auf Updates.
 
-Grafik: Helligkeit, Kontrast, Gamma und Farben pro Bildschirm (oben rechts wählbar).
-Boost:  Mit "+" Programme hinzufügen (Streams, YouTube-Videos, Games, Mehr). Solange der Haken
-        gesetzt ist und das Programm läuft, bekommt es höhere Priorität, Windows wird auf
-        "Höchstleistung" gestellt und bei Spielen wird die schnelle Grafikkarte bevorzugt.
-        Beim Beenden von PixelBoost wird alles wieder zurückgesetzt.
-
-Installation:  einfach starten – beim ersten Start werden fehlende Pakete
-               (customtkinter, requests, pystray, Pillow, psutil) automatisch geladen.
+Fehler: Wenn etwas schiefgeht, zeigt PixelBoost eine Meldung und schreibt
+        %APPDATA%\\PixelBoost\\error.log
 
 Firebase Realtime Database:
 {
   "pixelboost": {
-    "version": "1.2.0",
+    "version": "1.3.0",
     "download_url": "https://raw.githubusercontent.com/mirco5375-lab/pixelboost/main/pixelboost.pyw"
   }
 }
@@ -40,13 +37,62 @@ import uuid
 import queue
 import socket
 import ctypes
+import shutil
 import threading
 import subprocess
 import tempfile
+import traceback
 import importlib
 import importlib.util
 
-# ---------------- Erststart: fehlende Pakete automatisch laden ----------------
+APP_NAME = "PixelBoost"
+APP_VERSION = "1.3.0"
+FIREBASE_URL = "https://host-a4d95-default-rtdb.europe-west1.firebasedatabase.app"
+FIREBASE_NODE = "pixelboost"
+TIMEOUT = 8
+INSTANCE_PORT = 49731  # lokaler Port, damit nur eine Instanz im Hintergrund läuft
+
+APP_FILE = os.path.abspath(__file__)
+SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PixelBoost")
+SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
+LOG_FILE = os.path.join(SETTINGS_DIR, "error.log")
+INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PixelBoost")
+INSTALL_APP = os.path.join(INSTALL_DIR, "app", "pixelboost.pyw")
+INSTALL_EXE = os.path.join(INSTALL_DIR, "dist", "PixelBoost", "PixelBoost.exe")
+NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+# ---------------- Fehler sichtbar machen ----------------
+def log_error(text):
+    try:
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}  v{APP_VERSION} ---\n{text}\n")
+    except Exception:
+        pass
+
+
+def show_fatal(text):
+    msg = "PixelBoost konnte nicht starten.\n\n" + text.strip()[-700:] + f"\n\nDetails: {LOG_FILE}"
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        r = tk.Tk()
+        r.withdraw()
+        messagebox.showerror("PixelBoost", msg)
+        r.destroy()
+    except Exception:
+        try:
+            ctypes.windll.user32.MessageBoxW(0, msg, "PixelBoost", 0x10)
+        except Exception:
+            pass
+
+
+def center_xy(root, w, h):
+    return f"{w}x{h}+{(root.winfo_screenwidth() - w) // 2}+{(root.winfo_screenheight() - h) // 2}"
+
+
+# ---------------- Pakete / Einrichtung ----------------
 REQUIRED = {
     "customtkinter": "customtkinter",
     "requests": "requests",
@@ -54,15 +100,34 @@ REQUIRED = {
     "PIL": "Pillow",
     "psutil": "psutil",
 }
-NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+STATIC_IMPORTS = [
+    "os", "sys", "re", "json", "time", "uuid", "queue", "socket", "ctypes", "ctypes.wintypes", "shutil",
+    "threading", "subprocess", "tempfile", "traceback", "importlib", "importlib.util", "site", "ast",
+    "winreg", "tkinter", "tkinter.ttk", "tkinter.messagebox", "tkinter.filedialog", "tkinter.colorchooser",
+    "requests", "urllib3", "certifi", "psutil", "customtkinter", "darkdetect", "pystray", "pystray._win32",
+    "PIL.Image", "PIL.ImageDraw", "PIL.ImageTk",
+]
 
 
 def missing_packages():
     return [pkg for mod, pkg in REQUIRED.items() if importlib.util.find_spec(mod) is None]
 
 
+def refresh_user_site():
+    """Frisch installierte --user-Pakete sofort auffindbar machen."""
+    try:
+        import site
+        usp = site.getusersitepackages()
+        if os.path.isdir(usp) and usp not in sys.path:
+            site.addsitedir(usp)
+    except Exception:
+        pass
+    importlib.invalidate_caches()
+
+
 def first_run_setup(missing):
-    """Kleines Setup-Fenster (nur Standard-tkinter), das alles beim ersten Start nachlädt."""
+    """Kleines Setup-Fenster (nur Standard-tkinter), das fehlende Pakete nachlädt."""
     import tkinter as tk
     from tkinter import ttk, messagebox
 
@@ -70,12 +135,10 @@ def first_run_setup(missing):
     root.title("PixelBoost – Ersteinrichtung")
     root.configure(bg="#14161a")
     root.resizable(False, False)
-    w, h = 420, 190
-    root.geometry(f"{w}x{h}+{(root.winfo_screenwidth() - w) // 2}+{(root.winfo_screenheight() - h) // 2}")
+    root.geometry(center_xy(root, 420, 190))
 
     tk.Label(root, text="PixelBoost", font=("Segoe UI", 22, "bold"), fg="white", bg="#14161a").pack(pady=(24, 2))
-    tk.Label(root, text="Erster Start – benötigte Komponenten werden geladen",
-             fg="#9aa0a6", bg="#14161a").pack()
+    tk.Label(root, text="Benötigte Komponenten werden geladen", fg="#9aa0a6", bg="#14161a").pack()
     status = tk.Label(root, text="Bereite vor …", fg="white", bg="#14161a")
     status.pack(pady=(18, 6))
     bar = ttk.Progressbar(root, length=320, maximum=len(missing))
@@ -100,41 +163,286 @@ def first_run_setup(missing):
     root.mainloop()
 
     if result["error"]:
+        log_error(result["error"])
         err = tk.Tk()
         err.withdraw()
         messagebox.showerror("PixelBoost", result["error"])
         sys.exit(1)
-    importlib.invalidate_caches()
+    refresh_user_site()
 
 
-if not getattr(sys, "frozen", False):  # bei einer fertigen .exe sind die Pakete schon enthalten
-    _missing = missing_packages()
-    if _missing:
-        first_run_setup(_missing)
+def ask_install():
+    """Einwilligung zur Einrichtung. Gibt 'install', 'run' oder 'cancel' zurück."""
+    import tkinter as tk
 
-import requests
-import psutil
-import customtkinter as ctk
+    result = {"v": "cancel"}
+    root = tk.Tk()
+    root.title("PixelBoost einrichten")
+    root.configure(bg="#14161a")
+    root.resizable(False, False)
+    root.geometry(center_xy(root, 540, 380))
 
-# ---------------- Konfiguration ----------------
-APP_NAME = "PixelBoost"
-APP_VERSION = "1.2.0"
-FIREBASE_URL = "https://host-a4d95-default-rtdb.europe-west1.firebasedatabase.app"
-FIREBASE_NODE = "pixelboost"
-TIMEOUT = 8
-INSTANCE_PORT = 49731  # lokaler Port, damit nur eine Instanz im Hintergrund läuft
+    def choose(v):
+        result["v"] = v
+        root.destroy()
+
+    tk.Label(root, text="PixelBoost einrichten", font=("Segoe UI", 18, "bold"),
+             fg="white", bg="#14161a").pack(pady=(22, 10))
+    text = ("Wenn du zustimmst, passiert Folgendes:\n\n"
+            f"•  Ein Ordner wird angelegt:\n    {INSTALL_DIR}\n\n"
+            "•  PixelBoost wird dort zu einer EXE gebaut (einmalig, dauert einige Minuten, Internet nötig)\n\n"
+            "•  Auf dem Desktop erscheint die Verknüpfung „PixelBoost“\n\n"
+            "•  Updates kommen danach automatisch über den Launcher")
+    tk.Label(root, text=text, justify="left", anchor="w", wraplength=490,
+             fg="#d0d3d8", bg="#14161a").pack(padx=24, fill="x")
+
+    btns = tk.Frame(root, bg="#14161a")
+    btns.pack(side="bottom", pady=22)
+    tk.Button(btns, text="Akzeptieren und einrichten", bg="#2ecc71", fg="#0b0d10", relief="flat",
+              padx=14, pady=8, command=lambda: choose("install")).pack(side="left", padx=6)
+    tk.Button(btns, text="Nur diesmal starten", bg="#2a2d33", fg="white", relief="flat",
+              padx=14, pady=8, command=lambda: choose("run")).pack(side="left", padx=6)
+    tk.Button(btns, text="Abbrechen", bg="#2a2d33", fg="white", relief="flat",
+              padx=14, pady=8, command=lambda: choose("cancel")).pack(side="left", padx=6)
+    root.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+    root.mainloop()
+    return result["v"]
+
+
+def python_exe():
+    cand = os.path.join(os.path.dirname(sys.executable), "python.exe")
+    return cand if os.path.exists(cand) else sys.executable
+
+
+def run_cmd(cmd, log_path, step):
+    with open(log_path, "a", encoding="utf-8", errors="replace") as log:
+        log.write("\n$ " + " ".join(cmd) + "\n")
+        log.flush()
+        r = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+    if r.returncode != 0:
+        raise RuntimeError(f"{step} ist fehlgeschlagen.\nDetails: {log_path}")
+
+
+def build_stub(app_path):
+    """Kleines Startprogramm für die EXE: packt alle Bibliotheken ein und führt app/pixelboost.pyw aus."""
+    import ast
+    lines = {f"import {m}" for m in STATIC_IMPORTS}
+    try:
+        with open(app_path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    lines.add(f"import {a.name}")
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                for a in node.names:
+                    lines.add(f"from {node.module} import {a.name}")
+    except Exception:
+        pass
+    imports = "\n".join(f"try:\n    {line}\nexcept Exception:\n    pass" for line in sorted(lines))
+    return (
+        "import os, sys, runpy\n"
+        + imports
+        + "\n\n"
+        "APP = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'PixelBoost', 'app', 'pixelboost.pyw')\n\n"
+        "def _fail(text):\n"
+        "    try:\n"
+        "        import ctypes\n"
+        "        ctypes.windll.user32.MessageBoxW(0, text[-900:], 'PixelBoost', 0x10)\n"
+        "    except Exception:\n"
+        "        pass\n\n"
+        "if __name__ == '__main__':\n"
+        "    try:\n"
+        "        runpy.run_path(APP, run_name='__main__')\n"
+        "    except SystemExit:\n"
+        "        raise\n"
+        "    except BaseException:\n"
+        "        import traceback\n"
+        "        _fail('PixelBoost konnte nicht starten:\\n\\n' + traceback.format_exc())\n"
+        "        sys.exit(1)\n"
+    )
+
+
+def make_icon(path):
+    try:
+        from PIL import Image, ImageDraw
+        img = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle((16, 16, 240, 240), radius=56, fill=(46, 204, 113, 255))
+        dark = (20, 22, 26, 255)
+        d.rectangle((88, 64, 120, 192), fill=dark)
+        d.rectangle((88, 64, 168, 96), fill=dark)
+        d.rectangle((88, 120, 168, 152), fill=dark)
+        d.rectangle((144, 64, 176, 152), fill=dark)
+        img.save(path, format="ICO", sizes=[(256, 256), (64, 64), (48, 48), (32, 32), (16, 16)])
+        return path
+    except Exception:
+        return None
+
+
+def create_shortcut():
+    def q(s):
+        return s.replace("'", "''")
+    ps = ("$d=[Environment]::GetFolderPath('Desktop');"
+          "$s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'PixelBoost.lnk'));"
+          f"$s.TargetPath='{q(INSTALL_EXE)}';$s.WorkingDirectory='{q(os.path.dirname(INSTALL_EXE))}';"
+          f"$s.IconLocation='{q(INSTALL_EXE)},0';$s.Save()")
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                       capture_output=True, text=True, creationflags=NO_WINDOW)
+    if r.returncode != 0:
+        log_error("Desktop-Verknüpfung fehlgeschlagen:\n" + (r.stderr or ""))
+
+
+def install_to_exe(report):
+    py = python_exe()
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    log = os.path.join(INSTALL_DIR, "install.log")
+    open(log, "w").close()
+
+    report("Pakete werden vorbereitet …")
+    pkgs = missing_packages()
+    if importlib.util.find_spec("PyInstaller") is None:
+        pkgs.append("pyinstaller")
+    for pkg in pkgs:
+        report(f"Lade {pkg} …")
+        run_cmd([py, "-m", "pip", "install", "--user", "--disable-pip-version-check", pkg],
+                log, f"Die Installation von {pkg}")
+    refresh_user_site()
+
+    report("Ordner wird angelegt …")
+    os.makedirs(os.path.dirname(INSTALL_APP), exist_ok=True)
+    shutil.copyfile(APP_FILE, INSTALL_APP)
+    build_dir = os.path.join(INSTALL_DIR, "build")
+    os.makedirs(build_dir, exist_ok=True)
+    stub_path = os.path.join(build_dir, "pixelboost_stub.py")
+    with open(stub_path, "w", encoding="utf-8") as f:
+        f.write(build_stub(INSTALL_APP))
+    icon = make_icon(os.path.join(build_dir, "pixelboost.ico"))
+
+    report("Programm wird zur EXE gebaut – das dauert ein paar Minuten …")
+    cmd = [py, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir", "--noconsole",
+           "--name", "PixelBoost",
+           "--distpath", os.path.join(INSTALL_DIR, "dist"),
+           "--workpath", os.path.join(build_dir, "work"),
+           "--specpath", build_dir,
+           "--collect-all", "customtkinter",
+           "--hidden-import", "pystray._win32"]
+    if icon:
+        cmd += ["--icon", icon]
+    cmd.append(stub_path)
+    run_cmd(cmd, log, "Das Bauen der EXE")
+    if not os.path.exists(INSTALL_EXE):
+        raise RuntimeError(f"Die EXE wurde nicht erstellt.\nDetails: {log}")
+
+    report("Verknüpfung auf dem Desktop wird erstellt …")
+    create_shortcut()
+
+
+def run_installer():
+    """Zeigt den Fortschritt und baut die EXE. True = alles hat geklappt."""
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    q = queue.Queue()
+    result = {"ok": False, "error": None}
+
+    root = tk.Tk()
+    root.title("PixelBoost wird eingerichtet")
+    root.configure(bg="#14161a")
+    root.resizable(False, False)
+    root.geometry(center_xy(root, 480, 210))
+    root.protocol("WM_DELETE_WINDOW", lambda: None)  # während des Bauens nicht schließbar
+    tk.Label(root, text="PixelBoost", font=("Segoe UI", 22, "bold"), fg="white", bg="#14161a").pack(pady=(24, 2))
+    tk.Label(root, text="Bitte nicht schließen – das passiert nur einmal.", fg="#9aa0a6", bg="#14161a").pack()
+    status = tk.Label(root, text="Starte …", fg="white", bg="#14161a", wraplength=430)
+    status.pack(pady=(18, 8))
+    bar = ttk.Progressbar(root, length=360, mode="indeterminate")
+    bar.pack()
+    bar.start(12)
+
+    def work():
+        try:
+            install_to_exe(q.put)
+            result["ok"] = True
+        except Exception as e:
+            result["error"] = str(e)
+            log_error(traceback.format_exc())
+        q.put(None)
+
+    def poll():
+        try:
+            while True:
+                item = q.get_nowait()
+                if item is None:
+                    root.destroy()
+                    return
+                status.configure(text=item)
+        except queue.Empty:
+            pass
+        root.after(200, poll)
+
+    threading.Thread(target=work, daemon=True).start()
+    poll()
+    root.mainloop()
+
+    if result["error"]:
+        err = tk.Tk()
+        err.withdraw()
+        messagebox.showerror("PixelBoost", "Die Einrichtung hat nicht geklappt:\n\n" + result["error"]
+                             + "\n\nPixelBoost startet jetzt normal weiter.")
+        err.destroy()
+    return result["ok"]
+
+
+def start_installed_exe():
+    try:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
+        subprocess.Popen([INSTALL_EXE], cwd=os.path.dirname(INSTALL_EXE), env=env)
+    except OSError:
+        log_error(traceback.format_exc())
+
+
+def startup_checks():
+    if getattr(sys, "frozen", False):  # läuft schon als EXE
+        return
+    refresh_user_site()
+    if os.name == "nt" and "--dev" not in sys.argv:
+        if os.path.exists(INSTALL_EXE):
+            start_installed_exe()
+            sys.exit(0)
+        choice = ask_install()
+        if choice == "cancel":
+            sys.exit(0)
+        if choice == "install" and run_installer():
+            start_installed_exe()
+            sys.exit(0)
+    missing = missing_packages()
+    if missing:
+        first_run_setup(missing)
+
+
+startup_checks()
+
+try:
+    import requests
+    import psutil
+    import customtkinter as ctk
+except Exception:
+    _text = traceback.format_exc()
+    log_error(_text)
+    show_fatal(_text)
+    sys.exit(1)
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("green")
 
 # ---------------- Gespeicherte Daten ----------------
 DEFAULTS = {"brightness": 0, "contrast": 100, "gamma": 1.0, "red": 100, "green": 100, "blue": 100}
-SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PixelBoost")
-SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
+BG_COLORS = ["#14161a", "#000000", "#0d1b2a", "#1b1030", "#0f2a1c", "#2a0f12"]
 
 
 def load_state():
-    st = {"monitors": {}, "selected": None, "boosts": []}
+    st = {"monitors": {}, "selected": None, "boosts": [], "bg": {"color": None, "image": None}}
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -147,6 +455,8 @@ def load_state():
         st["selected"] = data.get("selected")
         st["boosts"] = [b for b in data.get("boosts", [])
                         if isinstance(b, dict) and b.get("id") and b.get("exes")]
+        bg = data.get("bg") or {}
+        st["bg"] = {"color": bg.get("color"), "image": bg.get("image")}
     except Exception:
         pass
     return st
@@ -159,6 +469,15 @@ def save_state(st):
             json.dump(st, f)
     except Exception:
         pass
+
+
+def shade(hex_color, amount):
+    """Farbe aufhellen (amount > 0) oder abdunkeln (amount < 0)."""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    target = 255 if amount > 0 else 0
+    a = abs(amount)
+    return "#%02x%02x%02x" % tuple(int(c + (target - c) * a) for c in (r, g, b))
 
 
 # ---------------- Bildschirme: Helligkeit, Kontrast, Gamma, Farben ----------------
@@ -295,7 +614,7 @@ class BoostEngine:
             try:
                 self.tick()
             except Exception:
-                pass
+                log_error(traceback.format_exc())
             self.wake.wait(3)
             self.wake.clear()
 
@@ -429,7 +748,7 @@ def fetch_remote_info():
 
 
 def download_update(url: str, progress_cb):
-    target = os.path.abspath(sys.argv[0])
+    target = APP_FILE
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".new", dir=os.path.dirname(target))
     os.close(tmp_fd)
     try:
@@ -455,20 +774,12 @@ def download_update(url: str, progress_cb):
 
 
 def apply_update_and_restart(tmp_path: str, target: str):
+    os.replace(tmp_path, target)
     if getattr(sys, "frozen", False):
-        # .exe: kann sich nicht selbst ersetzen -> kleine Batch-Datei erledigt das nach dem Beenden
-        bat = os.path.join(tempfile.gettempdir(), "pixelboost_update.bat")
-        with open(bat, "w") as f:
-            f.write(
-                "@echo off\r\n"
-                "timeout /t 2 /nobreak >nul\r\n"
-                f'move /y "{tmp_path}" "{target}"\r\n'
-                f'start "" "{target}"\r\n'
-                "del \"%~f0\"\r\n"
-            )
-        subprocess.Popen(["cmd", "/c", bat], creationflags=NO_WINDOW)
+        # EXE: nur die Programmdatei wurde getauscht, die EXE startet sie neu
+        env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
+        subprocess.Popen([sys.executable], cwd=os.path.dirname(sys.executable), env=env)
     else:
-        os.replace(tmp_path, target)
         subprocess.Popen([sys.executable, target])
     os._exit(0)
 
@@ -477,13 +788,13 @@ def apply_update_and_restart(tmp_path: str, target: str):
 def kick_old_instance():
     """Beendet eine schon laufende (versteckte) Instanz, damit der Launcher neu prüfen kann."""
     try:
-        with socket.create_connection(("127.0.0.1", INSTANCE_PORT), timeout=1) as s:
+        with socket.create_connection(("127.0.0.1", INSTANCE_PORT), timeout=0.3) as s:
             s.sendall(b"quit")
     except OSError:
         return
-    for _ in range(30):  # warten, bis die alte Instanz wirklich weg ist
+    for _ in range(40):  # warten, bis die alte Instanz wirklich weg ist
         try:
-            socket.create_connection(("127.0.0.1", INSTANCE_PORT), timeout=0.5).close()
+            socket.create_connection(("127.0.0.1", INSTANCE_PORT), timeout=0.3).close()
             time.sleep(0.1)
         except OSError:
             break
@@ -546,7 +857,7 @@ class AddBoostDialog(ctk.CTkToplevel):
         self.ok_btn = ctk.CTkButton(btns, text="OK", width=120, corner_radius=20, command=self.ok)
         self.ok_btn.pack(side="left", padx=8)
 
-        self.info = ctk.CTkLabel(self, text="", wraplength=420, justify="left")
+        self.info = ctk.CTkLabel(self, text="", wraplength=420, anchor="w")
         self.info.pack(pady=(20, 10), padx=20, anchor="w")
         self.pick_btn = ctk.CTkButton(self, text="Programm wählen …", corner_radius=20, command=self.pick)
         self.picked = ctk.CTkLabel(self, text="", text_color="gray", wraplength=420)
@@ -612,10 +923,10 @@ class App(ctk.CTk):
         self.tray = None
         self.engine = None
         self.state = load_state()
-        self.monitors = list_monitors()
-        self.mon_by_label = {label: dev for dev, label in self.monitors}
-        devs = [d for d, _ in self.monitors]
-        self.cur_dev = self.state["selected"] if self.state["selected"] in devs else devs[0]
+        self.monitors = [("", "Hauptbildschirm")]
+        self.mon_by_label = {}
+        self.cur_dev = ""
+        self._mons = None
         self.gamma_touched = set()
         self.main_ready = False
         self._closing = False
@@ -623,16 +934,21 @@ class App(ctk.CTk):
         self.update_info = None
         self.sliders = {}
         self.boost_rows = {}
+        self.bg_label = None
+        self._bg_src = None
+        self._bg_photo = None
+        self._bg_job = None
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self.poll)
         self.show_launcher()
 
+    def report_callback_exception(self, exc, val, tb):
+        log_error("".join(traceback.format_exception(exc, val, tb)))
+
     # ----- Hilfen -----
     def center(self, w, h):
-        x = (self.winfo_screenwidth() - w) // 2
-        y = (self.winfo_screenheight() - h) // 2
-        return f"{w}x{h}+{x}+{y}"
+        return center_xy(self, w, h)
 
     def run_ui(self, fn):
         """Aus Threads heraus sicher etwas im Fenster ändern."""
@@ -652,7 +968,7 @@ class App(ctk.CTk):
         except queue.Empty:
             pass
         except Exception:
-            pass
+            log_error(traceback.format_exc())
         if not self._closing:
             self.after(100, self.poll)
 
@@ -688,6 +1004,13 @@ class App(ctk.CTk):
     def cur_settings(self):
         return self.state["monitors"].setdefault(self.cur_dev, dict(DEFAULTS))
 
+    def setup_monitors(self, mons):
+        self.monitors = mons
+        self.mon_by_label = {label: dev for dev, label in mons}
+        devs = [d for d, _ in mons]
+        sel = self.state["selected"]
+        self.cur_dev = sel if sel in devs else devs[0]
+
     # ----- Launcher -----
     def show_launcher(self):
         self.title(f"{APP_NAME} Launcher")
@@ -715,6 +1038,10 @@ class App(ctk.CTk):
             self.l_bar.set(progress)
 
     def check_update(self):
+        try:
+            self._mons = list_monitors()  # im Hintergrund, damit das Fenster sofort reagiert
+        except Exception:
+            self._mons = [("", "Hauptbildschirm")]
         self.run_ui(lambda: self.set_status("Suche nach Updates …", 0.15))
         try:
             info = fetch_remote_info()
@@ -750,6 +1077,7 @@ class App(ctk.CTk):
             self.run_ui(lambda: self.set_status("Installiere Update …", 1.0))
             apply_update_and_restart(tmp, target)
         except Exception:
+            log_error(traceback.format_exc())
             self.run_ui(self.update_failed)
 
     def update_failed(self):
@@ -759,8 +1087,24 @@ class App(ctk.CTk):
 
     # ----- Hauptfenster -----
     def open_main(self):
+        try:
+            self._open_main()
+        except Exception:
+            text = traceback.format_exc()
+            log_error(text)
+            try:
+                from tkinter import messagebox
+                messagebox.showerror("PixelBoost", "Beim Start ist ein Fehler aufgetreten:\n\n"
+                                     + text.strip()[-600:] + f"\n\nDetails: {LOG_FILE}", parent=self)
+            except Exception:
+                pass
+            self.quit_app()
+
+    def _open_main(self):
+        self.setup_monitors(self._mons or [("", "Hauptbildschirm")])
         self.lf.destroy()
         self.build_main()
+        self.apply_background()
         present = {d for d, _ in self.monitors}
         for dev, s in self.state["monitors"].items():  # gespeicherte Grafik-Werte wieder anwenden
             if dev in present and s != DEFAULTS:
@@ -777,28 +1121,36 @@ class App(ctk.CTk):
         self.minsize(760, 540)
         self.resizable(True, True)
 
-        sidebar = ctk.CTkFrame(self, width=200, corner_radius=0)
-        sidebar.pack(side="left", fill="y")
-        ctk.CTkLabel(sidebar, text=APP_NAME, font=("Segoe UI", 22, "bold")).pack(pady=(24, 4))
-        ctk.CTkLabel(sidebar, text=f"Version {APP_VERSION}", text_color="gray").pack(pady=(0, 24))
-        for label, page in (("Grafik", "gfx"), ("Boost", "boost")):
-            ctk.CTkButton(sidebar, text=label, corner_radius=20, fg_color="transparent",
+        self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=16)
+        self.sidebar.pack(side="left", fill="y", padx=(16, 0), pady=16)
+        ctk.CTkLabel(self.sidebar, text=APP_NAME, font=("Segoe UI", 22, "bold")).pack(pady=(24, 4), padx=16)
+        ctk.CTkLabel(self.sidebar, text=f"Version {APP_VERSION}", text_color="gray").pack(pady=(0, 24))
+        for label, page in (("Grafik", "gfx"), ("Boost", "boost"), ("Einstellungen", "settings")):
+            ctk.CTkButton(self.sidebar, text=label, corner_radius=20, fg_color="transparent",
                           border_width=1, anchor="w",
                           command=lambda p=page: self.show_page(p)).pack(padx=16, pady=5, fill="x")
 
-        content = ctk.CTkFrame(self, corner_radius=16)
-        content.pack(side="left", fill="both", expand=True, padx=16, pady=16)
+        self.content = ctk.CTkFrame(self, corner_radius=16)
+        self.content.pack(side="left", fill="both", expand=True, padx=16, pady=16)
 
-        self.page_gfx = ctk.CTkFrame(content, fg_color="transparent")
-        self.page_boost = ctk.CTkFrame(content, fg_color="transparent")
+        self.page_gfx = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.page_boost = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.page_settings = ctk.CTkFrame(self.content, fg_color="transparent")
         self.build_gfx_page()
         self.build_boost_page()
+        self.build_settings_page()
         self.show_page("gfx")
 
+        self._def_win = self.cget("fg_color")
+        self._def_side = self.sidebar.cget("fg_color")
+        self._def_content = self.content.cget("fg_color")
+        self.bind("<Configure>", self.on_configure, add="+")
+
     def show_page(self, name):
-        self.page_gfx.pack_forget()
-        self.page_boost.pack_forget()
-        (self.page_gfx if name == "gfx" else self.page_boost).pack(fill="both", expand=True)
+        for page in (self.page_gfx, self.page_boost, self.page_settings):
+            page.pack_forget()
+        {"gfx": self.page_gfx, "boost": self.page_boost,
+         "settings": self.page_settings}[name].pack(fill="both", expand=True)
 
     # ----- Seite: Grafik -----
     def build_gfx_page(self):
@@ -838,7 +1190,7 @@ class App(ctk.CTk):
             slider.pack(side="left", fill="x", expand=True, padx=12)
             self.sliders[key] = (slider, val, fmt)
 
-        self.gfx_hint = ctk.CTkLabel(p, text="", text_color="#e5a50a", wraplength=560, justify="left")
+        self.gfx_hint = ctk.CTkLabel(p, text="", text_color="#e5a50a", wraplength=560, anchor="w")
         self.gfx_hint.pack(anchor="w", padx=24, pady=(10, 0))
         ctk.CTkButton(p, text="Zurücksetzen", width=160, corner_radius=20,
                       command=self.reset_gfx).pack(anchor="w", padx=24, pady=(10, 0))
@@ -972,6 +1324,121 @@ class App(ctk.CTk):
             pass
         self.after(1500, self.refresh_boost_status)
 
+    # ----- Seite: Einstellungen (Hintergrund) -----
+    def build_settings_page(self):
+        p = self.page_settings
+        ctk.CTkLabel(p, text="Einstellungen", font=("Segoe UI", 24, "bold")).pack(anchor="w", padx=24, pady=(20, 2))
+        ctk.CTkLabel(p, text="Hintergrund", font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=24, pady=(18, 6))
+
+        row = ctk.CTkFrame(p, fg_color="transparent")
+        row.pack(anchor="w", padx=20)
+        for c in BG_COLORS:
+            ctk.CTkButton(row, text="", width=34, height=34, corner_radius=17, fg_color=c,
+                          hover_color=shade(c, 0.2), border_width=1, border_color="#4a4f57",
+                          command=lambda col=c: self.set_bg_color(col)).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="Eigene Farbe …", corner_radius=20, command=self.pick_bg_color).pack(side="left", padx=12)
+
+        ctk.CTkButton(p, text="Hintergrundbild wählen …", corner_radius=20,
+                      command=self.pick_bg_image).pack(anchor="w", padx=24, pady=(16, 0))
+        ctk.CTkLabel(p, text="Das Bild ist rund um die Bereiche zu sehen.",
+                     text_color="gray").pack(anchor="w", padx=24, pady=(4, 0))
+        ctk.CTkButton(p, text="Zurücksetzen", width=160, corner_radius=20, fg_color="transparent",
+                      border_width=1, command=self.reset_background).pack(anchor="w", padx=24, pady=(18, 0))
+
+    def apply_background(self):
+        bg = self.state["bg"]
+        color = bg.get("color")
+        if color:
+            self.configure(fg_color=color)
+            self.sidebar.configure(fg_color=shade(color, 0.06))
+            self.content.configure(fg_color=shade(color, 0.10))
+        else:
+            self.configure(fg_color=self._def_win)
+            self.sidebar.configure(fg_color=self._def_side)
+            self.content.configure(fg_color=self._def_content)
+        self.set_bg_image(bg.get("image"))
+
+    def set_bg_image(self, path):
+        if self.bg_label is not None:
+            self.bg_label.destroy()
+            self.bg_label = None
+        self._bg_src = None
+        if not path or not os.path.exists(path):
+            return
+        try:
+            from PIL import Image
+            img = Image.open(path).convert("RGB")
+            img.thumbnail((2200, 1400))
+            self._bg_src = img
+        except Exception:
+            log_error(traceback.format_exc())
+            return
+        import tkinter as tk
+        self.bg_label = tk.Label(self, bd=0, highlightthickness=0)
+        self.bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+        self.bg_label.lower()
+        self.render_bg()
+
+    def render_bg(self):
+        if self._bg_src is None or self.bg_label is None:
+            return
+        try:
+            from PIL import Image, ImageTk
+            w, h = max(1, self.winfo_width()), max(1, self.winfo_height())
+            iw, ih = self._bg_src.size
+            scale = max(w / iw, h / ih)
+            nw, nh = int(iw * scale) + 1, int(ih * scale) + 1
+            resample = getattr(Image, "Resampling", Image).LANCZOS
+            img = self._bg_src.resize((nw, nh), resample)
+            left, top = (nw - w) // 2, (nh - h) // 2
+            img = img.crop((left, top, left + w, top + h))
+            self._bg_photo = ImageTk.PhotoImage(img)
+            self.bg_label.configure(image=self._bg_photo)
+        except Exception:
+            log_error(traceback.format_exc())
+
+    def on_configure(self, event):
+        if event.widget is not self or self._bg_src is None:
+            return
+        if self._bg_job:
+            self.after_cancel(self._bg_job)
+        self._bg_job = self.after(200, self.render_bg)
+
+    def set_bg_color(self, color):
+        self.state["bg"] = {"color": color, "image": None}
+        self.apply_background()
+        save_state(self.state)
+
+    def pick_bg_color(self):
+        from tkinter import colorchooser
+        _, hexc = colorchooser.askcolor(parent=self, title="Hintergrundfarbe wählen")
+        if hexc:
+            self.set_bg_color(hexc)
+
+    def pick_bg_image(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            parent=self, title="Hintergrundbild wählen",
+            filetypes=[("Bilder", "*.png *.jpg *.jpeg *.bmp *.webp"), ("Alle Dateien", "*.*")])
+        if not path:
+            return
+        dest = path
+        try:
+            os.makedirs(SETTINGS_DIR, exist_ok=True)
+            dest = os.path.join(SETTINGS_DIR, "background" + os.path.splitext(path)[1].lower())
+            if os.path.abspath(path) != os.path.abspath(dest):
+                shutil.copyfile(path, dest)
+        except OSError:
+            dest = path
+        self.state["bg"]["image"] = dest
+        self.apply_background()
+        save_state(self.state)
+
+    def reset_background(self):
+        self.state["bg"] = {"color": None, "image": None}
+        self.apply_background()
+        save_state(self.state)
+
     # ----- Tray (Hintergrund) -----
     def start_tray(self):
         try:
@@ -995,9 +1462,21 @@ class App(ctk.CTk):
         self.tray.run_detached()
 
 
-if __name__ == "__main__":
+def main():
     kick_old_instance()
     app = App()
     start_instance_server(app.q)
     app.mainloop()
     os._exit(0)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        _text = traceback.format_exc()
+        log_error(_text)
+        show_fatal(_text)
+        os._exit(1)
